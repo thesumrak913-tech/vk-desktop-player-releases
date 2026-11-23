@@ -1,0 +1,78 @@
+name: Publish VK Desktop Player
+
+on:
+  push:
+    branches: ['release/v*']
+    paths: ['release/release.json']
+
+permissions: {}
+
+concurrency:
+  group: vk-desktop-player-releases
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release files
+        shell: bash
+        run: |
+          git init -q .
+          git fetch --no-tags --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$GITHUB_SHA"
+          git checkout -q --detach FETCH_HEAD
+
+      - name: Verify signed APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest=release/release.json
+          package=$(jq -er '.packageName | select(. == "ru.vkdesktopplayer.app")' "$manifest")
+          version=$(jq -er '.versionName | select(type == "string" and test("^[0-9A-Za-z][0-9A-Za-z.+_-]{0,39}$"))' "$manifest")
+          code=$(jq -er '.versionCode | select(type == "number" and floor == . and . > 0 and . <= 2100000000)' "$manifest")
+          tag="v$version"
+          test "$GITHUB_REF_NAME" = "release/$tag"
+          filename=$(jq -er '.apk' "$manifest")
+          test "$filename" = "VKDesktopPlayer-$version.apk"
+          apk="release/$filename"
+
+          size=$(jq -er '.sizeBytes | select(type == "number" and floor == . and . > 0)' "$manifest")
+          test "$(stat -c %s "$apk")" = "$size"
+          digest=$(jq -er '.sha256 | select(type == "string" and test("^[0-9a-f]{64}$"))' "$manifest")
+          printf '%s  %s\n' "$digest" "$apk" | sha256sum -c -
+
+          tools="$ANDROID_HOME/build-tools/36.0.0"
+          signature=$("$tools/apksigner" verify --min-sdk-version 29 --print-certs "$apk" | sed -n 's/^Signer #[0-9]* certificate SHA-256 digest: //p')
+          test "$signature" = 'db4030b11f82cf8599636f1e72347c809d1ddaf71ce72e9d4971acb00754e583'
+          badging=$("$tools/aapt2" dump badging "$apk" | sed -n '1p')
+          [[ "$badging" == "package: name='$package' versionCode='$code' versionName='$version'"* ]]
+
+          printf 'VK_TAG=%s\nVK_APK=%s\nVK_VERSION=%s\nVK_VERSION_CODE=%s\n' "$tag" "$apk" "$version" "$code" >> "$GITHUB_ENV"
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          latest=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases --limit 99 --json isLatest,tagName --jq '.[] | select(.isLatest) | .tagName')
+          if [[ -n "$latest" ]]; then
+            previous=$(mktemp -d)
+            gh release download "$latest" --repo "$GITHUB_REPOSITORY" --pattern release.json --dir "$previous"
+            previous_code=$(jq -er '.versionCode | select(type == "number" and floor == . and . > 0)' "$previous/release.json")
+            if [[ "$latest" == "$VK_TAG" ]] && cmp -s "$previous/release.json" release/release.json; then
+              gh release download "$latest" --repo "$GITHUB_REPOSITORY" --pattern "${VK_APK##*/}" --dir "$previous"
+              cmp "$VK_APK" "$previous/${VK_APK##*/}"
+              exit 0
+            fi
+            if (( VK_VERSION_CODE <= previous_code )); then
+              echo '::error::Increase versionCode before publishing a newer release.'
+              exit 1
+            fi
+          fi
+          gh release create "$VK_TAG" "$VK_APK" release/release.json \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest \
+            --title "VK Desktop Player $VK_VERSION" --notes "Подписанный APK для обновления VK Desktop Player."
